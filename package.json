@@ -1,0 +1,17 @@
+{
+  "name": "simba-demo-api",
+  "version": "1.0.0",
+  "description": "Simple API for the Project Simba pipeline demo (commit -> GitHub Actions -> ECS)",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
+  }
+}

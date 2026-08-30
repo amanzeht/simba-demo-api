@@ -1,0 +1,35 @@
+{
+  "family": "simba-demo-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::431655581157:role/simba-demo-ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::431655581157:role/simba-demo-ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "simba-demo-api",
+      "image": "<PLACEHOLDER-replaced-by-pipeline>",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "PORT", "value": "8080" },
+        { "name": "APP_VERSION", "value": "1.0.0" },
+        { "name": "GIT_SHA", "value": "bootstrap" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/simba-demo-api",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

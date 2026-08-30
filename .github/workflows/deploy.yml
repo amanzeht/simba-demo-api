@@ -1,0 +1,125 @@
+name: Simba Demo - Build, Test, Deploy
+
+# Matches the pattern from the workshop deck:
+# every commit moves through the same stages before it can promote,
+# and only the pipeline - never a human - deploys to an environment.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: simba-demo-api
+  ECS_CLUSTER: simba-demo-cluster
+  ECS_SERVICE: simba-demo-api-service
+  ECS_TASK_DEFINITION: ecs-task-definition.json
+  CONTAINER_NAME: simba-demo-api
+
+jobs:
+  # Stage 1: Build
+  build-and-test:
+    name: Build & Unit/Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run unit & integration tests
+        run: npm test
+
+  # Stage 4: Security Testing (secrets scan + vulnerability scan)
+  # Non-negotiable per the deck: no credentials in the image, no known-vulnerable deps.
+  security-scan:
+    name: Security Testing (Secrets + Vulnerability Scan)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secrets scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Dependency vulnerability scan
+        run: npm audit --audit-level=high
+
+  # Stage 2: Container Image - build it and push to the registry
+  build-image-and-push:
+    name: Build Container Image & Push to ECR
+    needs: security-scan
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+    permissions:
+      id-token: write   # required for OIDC -> AWS, no long-lived AWS keys stored in the repo
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, tag, and push image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build --platform linux/amd64 -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+  # Stage 5: Load Testing - light touch for a dev/demo environment
+  load-test:
+    name: Light Load Test (demo)
+    needs: build-image-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder for a light smoke/load check
+        run: echo "Hit the demo endpoint with a light load tool (e.g. k6 or autocannon) once deployed. Real load testing kicks in at UAT."
+
+  # Deploy - only the pipeline pushes to an environment, never a person
+  deploy-to-ecs:
+    name: Deploy to ECS (Demo Cloud)
+    needs: [build-image-and-push, load-test]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Fill in the new image ID in the ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-image-and-push.outputs.image }}
+          environment-variables: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ github.sha }}
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
