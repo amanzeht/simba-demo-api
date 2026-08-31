@@ -16,7 +16,7 @@ env:
   ECS_CLUSTER: simba-demo-cluster
   ECS_TASK_DEFINITION: ecs-task-definition.json
   CONTAINER_NAME: simba-demo-api
-  DEMO_BASE_URL: ${{ vars.DEMO_BASE_URL }}
+  DEMO_BASE_URL: ${{ vars.DEMO_BASE_URL || 'http://simba-demo-alb-84496632.us-east-1.elb.amazonaws.com' }}
 
 jobs:
   validate:
@@ -118,10 +118,17 @@ jobs:
             echo "No image tagged :$SOURCE. Promote through the earlier environment first." >&2
             exit 1
           fi
-          aws ecr put-image \
+          if ! aws ecr put-image \
             --repository-name "$ECR_REPOSITORY" \
             --image-tag "$TARGET" \
-            --image-manifest "$MANIFEST" >/dev/null
+            --image-manifest "$MANIFEST" >/tmp/put-image.out 2>/tmp/put-image.err; then
+            if grep -q ImageAlreadyExistsException /tmp/put-image.err; then
+              echo "Tag :$TARGET already points at this digest — treating as a successful promote."
+            else
+              cat /tmp/put-image.err >&2
+              exit 1
+            fi
+          fi
           DIGEST=$(aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY" \
             --image-ids imageTag="$TARGET" \
