@@ -102,8 +102,9 @@ gateway (NAT would have been slower and more expensive).
 | GitHub Actions deploy role | `arn:aws:iam::431655581157:role/simba-demo-github-actions` |
 | GitHub OIDC provider | `arn:aws:iam::431655581157:oidc-provider/token.actions.githubusercontent.com` |
 
-The deploy role can: ECR auth + push to `simba-demo-api`, register/update ECS
-task definitions and this service, and `iam:PassRole` on the two ECS roles only.
+The deploy role can: ECR auth + push + `DescribeImages`/`PutImage` (needed to
+promote a digest without rebuilding), register/update ECS task definitions and
+the four env services, and `iam:PassRole` on the two ECS roles only.
 
 Trust policy allows `sts:AssumeRoleWithWebIdentity` and `sts:TagSession` from
 `token.actions.githubusercontent.com` with audience `sts.amazonaws.com`, and `sub`
