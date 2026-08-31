@@ -4,8 +4,6 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const BASE_PATH = (process.env.BASE_PATH || '').replace(/\/$/, '');
 const ENVIRONMENT = process.env.ENVIRONMENT || 'local';
-const AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
-const AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 
 function route(suffix = '') {
   if (!BASE_PATH) {
@@ -19,7 +17,7 @@ function route(suffix = '') {
 
 app.get(route('/'), (req, res) => {
   res.json({
-    message: 'Project Simba — change landed through the gates',
+    message: 'Project Simba demo API is live',
     team: 'Platform Engineering',
     environment: ENVIRONMENT,
   });

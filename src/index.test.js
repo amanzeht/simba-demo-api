@@ -49,7 +49,7 @@ describe('Simba demo API (BASE_PATH=/uat)', () => {
   test('GET /uat/health is the UAT health check', async () => {
     const res = await request(app).get('/uat/health');
     expect(res.statusCode).toBe(200);
-    expect(res.body.status).toBe('ok');
+    expect(res.body.status).toBe('healthy');
     expect(res.body.environment).toBe('uat');
   });
 
