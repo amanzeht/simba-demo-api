@@ -1,30 +1,31 @@
-name: Simba Demo - Build, Test, Deploy
+name: Simba Demo - Build, Test, Promote
 
-# Matches the pattern from the workshop deck:
-# every commit moves through the same stages before it can promote,
-# and only the pipeline - never a human - deploys to an environment.
+# Promotion path: feature → dev → test → UAT → prod
+# Every promotion is a pull request. Only the pipeline deploys.
+# The image is built once on dev. test / uat / prod retag that same digest.
 
 on:
   push:
-    branches: [ main ]
+    branches: [dev, test, uat, prod]
   pull_request:
-    branches: [ main ]
+    branches: [dev, test, uat, prod]
 
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: simba-demo-api
   ECS_CLUSTER: simba-demo-cluster
-  ECS_SERVICE: simba-demo-api-service
   ECS_TASK_DEFINITION: ecs-task-definition.json
   CONTAINER_NAME: simba-demo-api
+  DEMO_BASE_URL: ${{ vars.DEMO_BASE_URL }}
 
 jobs:
-  # Stage 1: Build
-  build-and-test:
-    name: Build & Unit/Integration Tests
+  validate:
+    name: Build, Tests, Security
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -33,17 +34,6 @@ jobs:
         run: npm ci
       - name: Run unit & integration tests
         run: npm test
-
-  # Stage 4: Security Testing (secrets scan + vulnerability scan)
-  # Non-negotiable per the deck: no credentials in the image, no known-vulnerable deps.
-  security-scan:
-    name: Security Testing (Secrets + Vulnerability Scan)
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - name: Secrets scan
         uses: gitleaks/gitleaks-action@v2
         env:
@@ -51,16 +41,17 @@ jobs:
       - name: Dependency vulnerability scan
         run: npm audit --audit-level=high
 
-  # Stage 2: Container Image - build it and push to the registry
-  build-image-and-push:
-    name: Build Container Image & Push to ECR
-    needs: security-scan
+  # Built once, when a feature PR lands on dev. Never rebuilt for later envs.
+  build-image:
+    name: Build image (dev only)
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     outputs:
-      image: ${{ steps.build-image.outputs.image }}
+      image: ${{ steps.push.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
     permissions:
-      id-token: write   # required for OIDC -> AWS, no long-lived AWS keys stored in the repo
+      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v4
@@ -72,30 +63,85 @@ jobs:
       - name: Login to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
-      - name: Build, tag, and push image
-        id: build-image
+      - name: Build once and tag as SHA + dev
+        id: push
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build --platform linux/amd64 -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          docker build --platform linux/amd64 -t "$IMAGE:$IMAGE_TAG" -t "$IMAGE:dev" .
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:dev"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$IMAGE_TAG")
+          echo "image=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
-  # Stage 5: Load Testing - light touch for a dev/demo environment
-  load-test:
-    name: Light Load Test (demo)
-    needs: build-image-and-push
+  # test retags :dev, uat retags :test, prod retags :uat — same bytes, new name.
+  promote-image:
+    name: Promote image digest (no rebuild)
+    needs: validate
+    if: github.event_name == 'push' && github.ref != 'refs/heads/dev'
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.promote.outputs.image }}
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - name: Placeholder for a light smoke/load check
-        run: echo "Hit the demo endpoint with a light load tool (e.g. k6 or autocannon) once deployed. Real load testing kicks in at UAT."
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Retag the upstream environment image
+        id: promote
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          TARGET: ${{ github.ref_name }}
+        run: |
+          case "$TARGET" in
+            test) SOURCE=dev ;;
+            uat)  SOURCE=test ;;
+            prod) SOURCE=uat ;;
+            *) echo "Unknown promotion target: $TARGET" >&2; exit 1 ;;
+          esac
+          echo "Promoting ECR tag :$SOURCE → :$TARGET (same digest, no rebuild)"
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$SOURCE" \
+            --query 'images[0].imageManifest' --output text)
+          if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "None" ]; then
+            echo "No image tagged :$SOURCE. Promote through the earlier environment first." >&2
+            exit 1
+          fi
+          aws ecr put-image \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-tag "$TARGET" \
+            --image-manifest "$MANIFEST" >/dev/null
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$TARGET" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY@$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Promoted $ECR_REGISTRY/$ECR_REPOSITORY@$DIGEST as :$TARGET"
 
-  # Deploy - only the pipeline pushes to an environment, never a person
-  deploy-to-ecs:
-    name: Deploy to ECS (Demo Cloud)
-    needs: [build-image-and-push, load-test]
+  deploy:
+    name: Deploy to ${{ github.ref_name }}
+    needs: [validate, build-image, promote-image]
+    # One of build-image / promote-image is always skipped; `always()` + success of validate.
+    if: >
+      github.event_name == 'push' &&
+      always() &&
+      needs.validate.result == 'success' &&
+      (needs.build-image.result == 'success' || needs.promote-image.result == 'success')
     runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name }}
+      url: ${{ env.DEMO_BASE_URL }}/${{ github.ref_name }}
     permissions:
       id-token: write
       contents: read
@@ -106,20 +152,48 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Fill in the new image ID in the ECS task definition
+      - name: Resolve image from the job that ran
+        id: image
+        run: |
+          if [ "${{ needs.build-image.result }}" = "success" ]; then
+            echo "image=${{ needs.build-image.outputs.image }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=${{ needs.promote-image.outputs.image }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Render task definition for this environment
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: ${{ env.ECS_TASK_DEFINITION }}
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ needs.build-image-and-push.outputs.image }}
+          image: ${{ steps.image.outputs.image }}
           environment-variables: |
             GIT_SHA=${{ github.sha }}
             APP_VERSION=${{ github.sha }}
-      - name: Deploy to Amazon ECS
+            ENVIRONMENT=${{ github.ref_name }}
+            BASE_PATH=/${{ github.ref_name }}
+            PORT=8080
+      - name: Pipeline-only deploy to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
+          service: simba-demo-api-${{ github.ref_name }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
+      - name: Smoke the environment that just went live
+        run: |
+          BASE="${{ env.DEMO_BASE_URL }}/${{ github.ref_name }}"
+          echo "Checking $BASE"
+          curl -sfS "$BASE/health"
+          echo
+          curl -sfS "$BASE/version"
+          echo
+          # UAT is pre-production: same artifact that will be allowed to go to prod.
+          if [ "${{ github.ref_name }}" = "uat" ]; then
+            echo "UAT is pre-production. This digest is what a prod PR will promote. No rebuild on prod."
+          fi
+      - name: Light load check (test environment)
+        if: github.ref_name == 'test'
+        run: |
+          npm install --global autocannon
+          autocannon -c 10 -d 10 "${{ env.DEMO_BASE_URL }}/test/health"

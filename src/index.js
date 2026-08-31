@@ -2,33 +2,43 @@ const express = require('express');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+const BASE_PATH = (process.env.BASE_PATH || '').replace(/\/$/, '');
+const ENVIRONMENT = process.env.ENVIRONMENT || 'local';
 
-// Simple root endpoint - what people will see when they hit the demo URL
-app.get('/', (req, res) => {
+function route(suffix = '') {
+  if (!BASE_PATH) {
+    return suffix || '/';
+  }
+  if (!suffix || suffix === '/') {
+    return [BASE_PATH, `${BASE_PATH}/`];
+  }
+  return `${BASE_PATH}${suffix}`;
+}
+
+app.get(route('/'), (req, res) => {
   res.json({
     message: 'Project Simba demo API is live',
     team: 'Platform Engineering',
+    environment: ENVIRONMENT,
   });
 });
 
-// Health check - used by the ECS load balancer / target group
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'healthy' });
+app.get(route('/health'), (req, res) => {
+  res.status(200).json({ status: 'healthy', environment: ENVIRONMENT });
 });
 
-// Version endpoint - proves which commit is actually running in the cluster,
-// which is the whole point of the demo (commit -> pipeline -> deployed)
-app.get('/version', (req, res) => {
+app.get(route('/version'), (req, res) => {
   res.json({
     version: process.env.APP_VERSION || 'dev',
     commit: process.env.GIT_SHA || 'unknown',
+    environment: ENVIRONMENT,
   });
 });
 
 /* istanbul ignore next */
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`Simba demo API listening on port ${PORT}`);
+    console.log(`Simba demo API listening on port ${PORT} (${ENVIRONMENT}${BASE_PATH || ''})`);
   });
 }
 
